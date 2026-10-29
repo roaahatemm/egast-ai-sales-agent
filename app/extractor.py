@@ -1,8 +1,238 @@
-
 import re
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
+
+def get_domain(url: str) -> str:
+    """Return the domain name from a URL."""
+    return (urlparse(url).hostname or "").lower().removeprefix("www.")
+
+GENERIC_EMAIL_PREFIXES = {
+    "info",
+    "contact",
+    "hello",
+    "admin",
+    "office",
+    "support",
+    "enquiries",
+    "inquiries",
+    "customerservice",
+    "webmaster",
+    "marketing",
+}
+
+SALES_EMAIL_PREFIXES = {
+    "sales",
+    "export",
+    "exports",
+    "trade",
+    "commercial",
+    "business",
+    "b2b",
+    "procurement",
+    "purchasing",
+}
+
+
+def extract_emails(text: str) -> list[str]:
+    """Extract unique email addresses from public page content."""
+    pattern = (
+        r"\b[A-Za-z0-9._%+-]+@"
+        r"[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"
+    )
+
+    emails = []
+    seen = set()
+
+    for email in re.findall(pattern, text or ""):
+        email = email.strip(".,;:!?").lower()
+
+        if email not in seen:
+            seen.add(email)
+            emails.append(email)
+
+    return emails
+
+
+def find_sales_emails(html: str, page_url: str) -> dict:
+    """
+    Extract publicly listed sales/export emails and other contacts.
+
+    This does not guess email addresses or verify that an address
+    belongs to a specific employee.
+    """
+    soup = BeautifulSoup(html or "", "html.parser")
+
+    # Extract visible text and mailto links.
+    visible_text = soup.get_text(" ", strip=True)
+    mailto_emails = []
+
+    for link in soup.find_all("a", href=True):
+        href = link["href"].strip()
+
+        if href.lower().startswith("mailto:"):
+            address = href[7:].split("?")[0].strip()
+            mailto_emails.extend(extract_emails(address))
+
+    all_emails = extract_emails(
+        visible_text + " " + " ".join(mailto_emails)
+    )
+
+    domain = (urlparse(page_url).hostname or "").lower()
+
+    if domain.startswith("www."):
+        domain = domain[4:]
+
+    # Prefer emails belonging to the company's own website domain.
+    company_emails = []
+    external_emails = []
+
+    for email in all_emails:
+        email_domain = email.rsplit("@", 1)[-1]
+
+        if (
+            email_domain == domain
+            or email_domain.endswith("." + domain)
+        ):
+            company_emails.append(email)
+        else:
+            external_emails.append(email)
+
+    # Prioritize sales/export-related addresses.
+    sales_emails = []
+    other_emails = []
+
+    for email in company_emails:
+        prefix = email.split("@", 1)[0].lower()
+        parts = re.split(r"[._+-]+", prefix)
+
+        if any(
+            part in SALES_EMAIL_PREFIXES
+            for part in parts
+        ):
+            sales_emails.append(email)
+        else:
+            other_emails.append(email)
+
+    return {
+        "sales_email": sales_emails[0] if sales_emails else "",
+        "sales_emails": sales_emails,
+        "company_emails": company_emails,
+        "other_emails": other_emails,
+        "external_emails": external_emails,
+        "all_emails": all_emails,
+        "source_url": page_url,
+    }
+
+
+def find_contact_page_urls(html: str, website: str) -> list[str]:
+    """Find likely public contact, sales, and export pages."""
+    soup = BeautifulSoup(html or "", "html.parser")
+
+    keywords = (
+        "contact",
+        "sales",
+        "export",
+        "team",
+        "about",
+        "commercial",
+    )
+
+    urls = []
+    seen = set()
+
+    for link in soup.find_all("a", href=True):
+        href = link["href"].strip()
+        label = link.get_text(" ", strip=True).lower()
+        combined = f"{href.lower()} {label}"
+
+        if not any(keyword in combined for keyword in keywords):
+            continue
+
+        full_url = urljoin(website.rstrip("/") + "/", href)
+        parsed = urlparse(full_url)
+
+        if parsed.scheme not in {"http", "https"}:
+            continue
+
+        # Avoid following unrelated external websites.
+        website_domain = (urlparse(website).hostname or "").lower()
+        target_domain = (parsed.hostname or "").lower()
+
+        if (
+            website_domain.startswith("www.")
+        ):
+            website_domain = website_domain[4:]
+
+        if target_domain.startswith("www."):
+            target_domain = target_domain[4:]
+
+        if target_domain != website_domain:
+            continue
+
+        normalized_url = full_url.split("#", 1)[0]
+
+        if normalized_url not in seen:
+            seen.add(normalized_url)
+            urls.append(normalized_url)
+
+    return urls
+def extract_lead(html: str, url: str) -> dict:
+    """
+    Preserve compatibility with the existing pipeline
+    while extracting sales and export email addresses.
+    """
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html or "", "html.parser")
+    text = soup.get_text(" ", strip=True)
+
+    # Reuse the email extraction functions above.
+    email_data = find_sales_emails(html, url)
+
+    domain = get_domain(url)
+    company_name = extract_company_name(soup, domain)
+    description = extract_description(soup)
+    country = detect_country(text)
+
+    business_text = f"{company_name} {description} {text}".lower()
+
+    if any(keyword in business_text for keyword in IMPORTER_KEYWORDS):
+        industry = "Fresh Produce Importer/Wholesaler"
+    elif any(keyword in business_text for keyword in [
+        "exporter", "export company", "export fresh"
+    ]):
+        industry = "Fresh Produce Exporter"
+    else:
+        industry = "Fresh Produce Business"
+
+    return {
+        "company_name": company_name,
+        "website": f"https://{domain}" if domain else url,
+        "email": (
+            email_data["sales_email"]
+            or (email_data["all_emails"][0]
+                if email_data["all_emails"] else "")
+        ),
+        "sales_email": email_data["sales_email"],
+        "sales_emails": email_data["sales_emails"],
+        "company_emails": email_data["company_emails"],
+        "all_emails": email_data["all_emails"],
+        "emails": email_data["all_emails"],
+        "sales_email_source": (
+            url if email_data["sales_email"] else ""
+        ),
+        "source_url": url,
+        "description": description,
+        "country": country,
+        "industry": industry,
+        "products": [],
+        "extraction_evidence": {
+            "industry_text": description or text[:500],
+            "product_text": description or text[:500],
+            "country_text": description or text[:500],
+        },
+    }
 
 
 GENERIC_TITLES = {
@@ -16,6 +246,7 @@ GENERIC_TITLES = {
     "index",
 }
 
+
 COUNTRY_KEYWORDS = {
     "Netherlands": ["netherlands", "the netherlands", "dutch"],
     "Germany": ["germany", "german"],
@@ -25,21 +256,6 @@ COUNTRY_KEYWORDS = {
     "Egypt": ["egypt", "egyptian"],
 }
 
-PRODUCT_KEYWORDS = [
-    "oranges",
-    "orange",
-    "valencia",
-    "navel",
-    "citrus",
-    "grapes",
-    "grape",
-    "pomegranates",
-    "pomegranate",
-    "vegetables",
-    "vegetable",
-    "fruit",
-    "fruits",
-]
 
 IMPORTER_KEYWORDS = [
     "importer",
@@ -83,38 +299,6 @@ def detect_country(text: str) -> str:
                 return country
 
     return ""
-
-
-def extract_emails(text: str) -> list[str]:
-    """Extract email addresses and remove duplicates."""
-    pattern = r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"
-
-    found = re.findall(pattern, text)
-    emails = []
-    seen = set()
-
-    for email in found:
-        normalized = email.strip().lower()
-
-        if normalized not in seen:
-            seen.add(normalized)
-            emails.append(normalized)
-
-    return emails
-
-
-def get_domain(url: str) -> str:
-    """Return a normalized hostname from a URL."""
-    if not url:
-        return ""
-
-    parsed = urlparse(url if "://" in url else "https://" + url)
-    hostname = (parsed.hostname or "").lower()
-
-    if hostname.startswith("www."):
-        hostname = hostname[4:]
-
-    return hostname
 
 
 def extract_company_name(soup: BeautifulSoup, domain: str) -> str:
@@ -170,127 +354,3 @@ def extract_description(soup: BeautifulSoup) -> str:
                 return description[:1000]
 
     return ""
-
-
-def extract_lead(html: str, url: str) -> dict:
-    """
-    Extract potential company lead information from website HTML.
-
-    This function extracts publicly visible page information. The
-    results are candidates for review, not proof that a company buys
-    EGAST products or is actively seeking suppliers.
-    """
-    soup = BeautifulSoup(html or "", "html.parser")
-
-    # Remove elements that usually contain navigation, scripts, or styles.
-    for element in soup(
-        ["script", "style", "noscript", "svg", "iframe"]
-    ):
-        element.decompose()
-
-    domain = get_domain(url)
-    website = f"https://{domain}" if domain else url
-
-    company_name = extract_company_name(soup, domain)
-    description = extract_description(soup)
-
-    # Collect visible text from the page.
-    text = clean_text(soup.get_text(" ", strip=True))
-    business_text = clean_text(
-        f"{company_name} {description} {text}"
-    ).lower()
-
-    # Detect country mentions. This may identify a target market rather
-    # than the company's own location, so treat it as a clue only.
-    country = detect_country(f"{description} {text}")
-
-    # Identify likely business type using evidence from the page.
-    if any(keyword in business_text for keyword in IMPORTER_KEYWORDS):
-        industry = "Fresh Produce Importer/Wholesaler"
-    elif any(
-        keyword in business_text
-        for keyword in ["exporter", "export company", "export fresh"]
-    ):
-        industry = "Fresh Produce Exporter"
-    elif any(
-        keyword in business_text
-        for keyword in ["fruit", "vegetable", "agriculture", "produce"]
-    ):
-        industry = "Fresh Produce Business"
-    else:
-        industry = ""
-
-    # Find email addresses in visible text and mailto links.
-    email_source = text
-
-    mailto_emails = []
-    for link in soup.find_all("a", href=True):
-        href = link["href"].strip()
-
-        if href.lower().startswith("mailto:"):
-            address = href[7:].split("?")[0].strip()
-            mailto_emails.append(address)
-
-    all_emails = extract_emails(email_source + " " + " ".join(mailto_emails))
-
-    # Prefer an email whose domain matches the website.
-    primary_email = ""
-
-    for email in all_emails:
-        email_domain = email.rsplit("@", 1)[-1].lower()
-
-        if domain and (
-            email_domain == domain
-            or email_domain.endswith("." + domain)
-        ):
-            primary_email = email
-            break
-
-    # If no matching domain was found, keep the first discovered email.
-    if not primary_email and all_emails:
-        primary_email = all_emails[0]
-
-    # Identify produce-related keywords found on the page.
-    products = []
-
-    for product in PRODUCT_KEYWORDS:
-        pattern = r"\b" + re.escape(product) + r"\b"
-
-        if re.search(pattern, business_text, flags=re.IGNORECASE):
-            # Normalize singular/plural and variety names.
-            if product in ["orange", "oranges", "valencia", "navel"]:
-                normalized_product = "oranges"
-            elif product in ["grape", "grapes"]:
-                normalized_product = "grapes"
-            elif product in ["pomegranate", "pomegranates"]:
-                normalized_product = "pomegranates"
-            elif product in ["vegetable", "vegetables"]:
-                normalized_product = "vegetables"
-            elif product in ["fruit", "fruits"]:
-                normalized_product = "fruit"
-            else:
-                normalized_product = product
-
-            if normalized_product not in products:
-                products.append(normalized_product)
-
-    # Keep short snippets to help a reviewer understand the extraction.
-    # These are page-level clues, not proof of buyer intent.
-    extraction_evidence = {
-        "industry_text": description or text[:500],
-        "product_text": description or text[:500],
-        "country_text": description or text[:500],
-    }
-
-    return {
-        "company_name": company_name or domain or "Unknown",
-        "website": website,
-        "email": primary_email,
-        "emails": all_emails,
-        "source_url": url,
-        "description": description,
-        "country": country,
-        "industry": industry,
-        "products": products,
-        "extraction_evidence": extraction_evidence,
-    }

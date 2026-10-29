@@ -1,4 +1,3 @@
-
 import sys
 import json
 from pathlib import Path
@@ -6,16 +5,26 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-# Allow imports from the project root.
+# --------------------------------------------------
+# PROJECT IMPORTS
+# --------------------------------------------------
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from app.database import get_all_leads, save_ai_qualification
+from app import database as database_module
+from app.database import (
+    get_all_leads,
+    save_ai_qualification,
+    normalize_website,
+)
 from app.local_ai_qualifier import qualify_lead
+from app.discovery import discover_leads
+from app.pipeline import process_website
 
 
 # --------------------------------------------------
-# PAGE CONFIGURATION
+# CONFIGURATION
 # --------------------------------------------------
 
 st.set_page_config(
@@ -29,6 +38,10 @@ st.caption(
     "Discover, qualify, and prioritize potential fresh-produce buyers."
 )
 
+MAX_NEW_WEBSITES_PER_RUN = 10
+MAX_SEARCH_QUERIES = 3
+RESULTS_PER_QUERY = 10
+
 
 # --------------------------------------------------
 # HELPER FUNCTIONS
@@ -36,8 +49,14 @@ st.caption(
 
 def display_value(value, fallback="Not available"):
     """Display missing database values cleanly."""
-    if value is None or pd.isna(value):
+    if value is None:
         return fallback
+
+    try:
+        if pd.isna(value):
+            return fallback
+    except (TypeError, ValueError):
+        pass
 
     value = str(value).strip()
 
@@ -48,12 +67,12 @@ def display_value(value, fallback="Not available"):
 
 
 def is_missing(value):
-    """Return True if a database value is empty or missing."""
+    """Return True when a value is missing."""
     return display_value(value, fallback="") == ""
 
 
 def load_leads():
-    """Load saved leads without changing the database."""
+    """Load the saved leads from the database."""
     records = get_all_leads()
     data = pd.DataFrame(records)
 
@@ -94,218 +113,276 @@ def load_leads():
     return data
 
 
-# --------------------------------------------------
-# LOAD SAVED LEADS
-# --------------------------------------------------
+def get_saved_domains(records):
+    """Return normalized website identifiers for saved records."""
+    domains = set()
 
-df = load_leads()
+    for record in records:
+        website = str(record.get("website") or "").strip()
 
-if df.empty:
-    st.info(
-        "No leads found yet. Run the discovery pipeline to add leads."
-    )
-    st.stop()
+        if not website:
+            continue
+
+        normalized = normalize_website(website)
+
+        if normalized:
+            domains.add(normalized)
+
+    return domains
 
 
-# --------------------------------------------------
-# AI QUALIFICATION CONTROLS
-# --------------------------------------------------
+def extract_url(result):
+    """Support discovery results represented as strings or dictionaries."""
+    if isinstance(result, str):
+        return result.strip()
 
-st.subheader("🤖 AI Lead Qualification")
-
-st.write(
-    "Use the local AI model to assess existing leads. "
-    "This does not run website discovery."
-)
-
-unqualified_mask = (
-    df["buyer_status"].apply(is_missing)
-    & df["ai_qualification_error"].apply(is_missing)
-)
-
-unqualified_count = int(unqualified_mask.sum())
-
-st.write(
-    f"**Leads awaiting qualification:** {unqualified_count}"
-)
-
-batch_size = st.selectbox(
-    "Number of leads to qualify",
-    options=[1, 5],
-    index=1,
-    help="Start with five leads to test the results before processing more.",
-)
-
-if unqualified_count > 0:
-    if st.button(
-        f"Qualify next {min(batch_size, unqualified_count)} leads",
-        type="primary",
-        use_container_width=False,
-    ):
-        # Select existing records that have no saved AI status
-        # and no previous AI error.
-        pending = df.loc[unqualified_mask].head(batch_size)
-
-        progress = st.progress(0)
-        status_text = st.empty()
-
-        successful = 0
-        failed = 0
-
-        for index, (_, row) in enumerate(pending.iterrows(), start=1):
-            lead_id = row["id"]
-            company_name = display_value(
-                row.get("company_name"), f"Lead {lead_id}"
-            )
-
-            status_text.write(
-                f"Qualifying {index}/{len(pending)}: {company_name}"
-            )
-
-            # Pass the saved lead to the AI without scraping
-            # or discovering the website again.
-            lead_for_ai = row.to_dict()
-
-            try:
-                qualification = qualify_lead(lead_for_ai)
-
-                save_ai_qualification(
-                    lead_id,
-                    qualification=qualification,
-                )
-
-                successful += 1
-
-            except Exception as exc:
-                error_message = f"{type(exc).__name__}: {exc}"
-
-                try:
-                    save_ai_qualification(
-                        lead_id,
-                        error=error_message,
-                    )
-                except Exception as db_exc:
-                    st.error(
-                        f"Could not save the error for "
-                        f"{company_name}: {db_exc}"
-                    )
-
-                failed += 1
-                st.warning(
-                    f"AI qualification failed for {company_name}: "
-                    f"{error_message}"
-                )
-
-            progress.progress(index / len(pending))
-
-        status_text.write("Batch finished.")
-
-        st.success(
-            f"Batch complete. Successful: {successful}. "
-            f"Failed: {failed}."
+    if isinstance(result, dict):
+        value = (
+            result.get("url")
+            or result.get("link")
+            or result.get("href")
         )
 
-        st.rerun()
+        if isinstance(value, str):
+            return value.strip()
 
-elif df["ai_qualification_error"].apply(is_missing).sum() == 0:
-    st.success("All saved leads have an AI qualification status.")
-
-else:
-    st.info(
-        "No unqualified leads without errors remain. "
-        "Review the AI Errors section below before retrying failed leads."
-    )
+    return ""
 
 
 # --------------------------------------------------
-# REFRESH DATA AFTER QUALIFICATION
+# INCREMENTAL DISCOVERY
+# --------------------------------------------------
+
+def run_incremental_discovery():
+    """
+    Discover and process at most 10 new website candidates.
+
+    Reports candidate counts and actual database row counts so
+    we can distinguish discovery failures from save failures.
+    """
+
+    saved_before = get_all_leads()
+    before_count = len(saved_before)
+    known_domains = get_saved_domains(saved_before)
+
+    st.write(f"**Saved leads before discovery:** {before_count}")
+
+    db_path = getattr(
+        database_module,
+        "DATABASE_PATH",
+        "Database path not exposed by app.database",
+    )
+    st.write(f"**Database path:** `{db_path}`")
+
+    st.write(
+        f"Searching up to {MAX_SEARCH_QUERIES} queries for "
+        f"a maximum of {MAX_NEW_WEBSITES_PER_RUN} new websites..."
+    )
+
+    # This requires the updated app/discovery.py to accept these arguments.
+    search_results = discover_leads(
+        max_queries=MAX_SEARCH_QUERIES,
+        results_per_query=RESULTS_PER_QUERY,
+        max_results=MAX_NEW_WEBSITES_PER_RUN,
+        exclude_domains=known_domains,
+    ) or []
+
+    st.write(
+        f"**Candidate results returned:** {len(search_results)}"
+    )
+
+    with st.expander("Inspect discovery results"):
+        st.json(search_results[:5])
+
+    new_urls = []
+    seen_domains = set()
+
+    for result in search_results:
+        url = extract_url(result)
+
+        if not url:
+            continue
+
+        domain = normalize_website(url)
+
+        if not domain:
+            continue
+
+        if domain in known_domains or domain in seen_domains:
+            continue
+
+        seen_domains.add(domain)
+        new_urls.append(url)
+
+        if len(new_urls) >= MAX_NEW_WEBSITES_PER_RUN:
+            break
+
+    st.write(
+        f"**New websites after duplicate filtering:** {len(new_urls)}"
+    )
+
+    if not new_urls:
+        saved_after = get_all_leads()
+        after_count = len(saved_after)
+
+        st.write(f"**Saved leads after discovery:** {after_count}")
+        st.write(
+            f"**Change in database row count:** "
+            f"{after_count - before_count}"
+        )
+
+        return {
+            "processed": 0,
+            "failed": 0,
+            "candidates": len(search_results),
+            "before": before_count,
+            "after": after_count,
+            "new_rows": after_count - before_count,
+        }
+
+    progress = st.progress(0)
+    status = st.empty()
+
+    processed = 0
+    failed = 0
+
+    for index, url in enumerate(new_urls, start=1):
+        status.write(
+            f"Processing website {index}/{len(new_urls)}: {url}"
+        )
+
+        try:
+            # Existing pipeline handles scraping, extraction,
+            # scoring, saving and AI qualification.
+            process_website(url)
+            processed += 1
+
+        except Exception as exc:
+            failed += 1
+            st.warning(
+                f"Failed to process {url}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+        progress.progress(index / len(new_urls))
+
+    # Re-read the database to verify whether records were saved.
+    saved_after = get_all_leads()
+    after_count = len(saved_after)
+    new_rows = after_count - before_count
+
+    status.write("Discovery batch finished.")
+
+    st.write(f"**Websites processed without an exception:** {processed}")
+    st.write(f"**Processing failures:** {failed}")
+    st.write(f"**Saved leads before:** {before_count}")
+    st.write(f"**Saved leads after:** {after_count}")
+    st.write(f"**Net change in database rows:** {new_rows}")
+
+    if new_rows <= 0 and processed > 0:
+        st.warning(
+            "Websites were processed, but the total database row count "
+            "did not increase. The pipeline may have updated existing "
+            "records, rejected extracted websites, or saved to a different "
+            "database. Check the terminal output and save_lead() logic."
+        )
+
+    return {
+        "processed": processed,
+        "failed": failed,
+        "candidates": len(search_results),
+        "before": before_count,
+        "after": after_count,
+        "new_rows": new_rows,
+    }
+
+
+# --------------------------------------------------
+# DASHBOARD CONTROLS
+# --------------------------------------------------
+
+control_col1, control_col2 = st.columns([1, 2])
+
+with control_col1:
+    if st.button(
+        "🔄 Refresh Dashboard",
+        use_container_width=True,
+    ):
+        st.rerun()
+
+with control_col2:
+    if st.button(
+        "🍊 Discover New Leads",
+        type="primary",
+        use_container_width=True,
+    ):
+        try:
+            with st.spinner("Discovering new websites..."):
+                result = run_incremental_discovery()
+
+            st.success(
+                f"Batch finished. Processed: {result['processed']}; "
+                f"failures: {result['failed']}; "
+                f"database rows: {result['before']} → {result['after']}."
+            )
+
+            if result["new_rows"] <= 0:
+                st.info(
+                    "No net increase in saved leads. Review the diagnostic "
+                    "numbers above to identify where the process stopped."
+                )
+
+        except Exception as exc:
+            st.error(
+                f"Discovery failed: {type(exc).__name__}: {exc}"
+            )
+
+        # Reload the UI from the database after processing.
+        st.rerun()
+
+
+# --------------------------------------------------
+# LOAD CURRENT DATA
 # --------------------------------------------------
 
 df = load_leads()
 
 if df.empty:
-    st.info("No leads found.")
+    st.info(
+        "No leads found yet. Click 'Discover New Leads' to start."
+    )
     st.stop()
 
-
 # --------------------------------------------------
-# MAIN KPI METRICS
-# --------------------------------------------------
-
-col1, col2, col3, col4 = st.columns(4)
-
-col1.metric("Total Leads", len(df))
-
-col2.metric(
-    "High-Priority Leads",
-    int((df["score"] >= 70).sum()),
-)
-
-col3.metric(
-    "Leads with Email",
-    int(
-        df["email"].fillna("").astype(str)
-        .str.strip().ne("").sum()
-    ),
-)
-
-col4.metric(
-    "Average Score",
-    f"{df['score'].mean():.0f}/100",
-)
-
-
-# --------------------------------------------------
-# AI QUALIFICATION OVERVIEW
+# LEAD QUALIFICATION — MAIN KPIs ONLY
 # --------------------------------------------------
 
-st.divider()
-st.subheader("AI Qualification Overview")
-
-has_status = ~df["buyer_status"].apply(is_missing)
+total_leads = len(df)
 
 potential_buyers = int(
     (df["buyer_status"] == "potential_buyer").sum()
 )
 
-needs_review = int(
-    (df["buyer_status"] == "uncertain").sum()
+st.divider()
+st.subheader("🤖 Lead Qualification")
+
+col1, col2 = st.columns(2)
+
+col1.metric(
+    "Total Leads",
+    total_leads,
 )
 
-not_buyers = int(
-    (df["buyer_status"] == "not_buyer").sum()
-)
-
-ai_errors = int(
-    (~df["ai_qualification_error"].apply(is_missing)).sum()
-)
-
-qualified_count = int(has_status.sum())
-
-ai_col1, ai_col2, ai_col3, ai_col4, ai_col5 = st.columns(5)
-
-ai_col1.metric("AI Qualified", qualified_count)
-ai_col2.metric("Potential Buyers", potential_buyers)
-ai_col3.metric("Needs Review", needs_review)
-ai_col4.metric("Not Buyers", not_buyers)
-ai_col5.metric("AI Errors", ai_errors)
-
-not_yet_qualified = int(
-    (
-        df["buyer_status"].apply(is_missing)
-        & df["ai_qualification_error"].apply(is_missing)
-    ).sum()
-)
-
-st.caption(
-    f"{not_yet_qualified} leads have not yet received "
-    "a saved AI qualification and have no recorded AI error."
+col2.metric(
+    "Potential Buyers",
+    potential_buyers,
 )
 
 
 # --------------------------------------------------
 # LEAD DIRECTORY AND FILTERS
 # --------------------------------------------------
+
 
 st.divider()
 st.subheader("Lead Directory")
@@ -325,13 +402,6 @@ selected_industry = st.selectbox(
     ["All industries"] + industries,
 )
 
-min_score = st.slider(
-    "Minimum lead score",
-    min_value=0,
-    max_value=100,
-    value=0,
-)
-
 buyer_statuses = [
     "All statuses",
     "potential_buyer",
@@ -348,6 +418,7 @@ selected_status = st.selectbox(
 
 filtered = df.copy()
 
+# Search by company, industry, email, or country
 if search_text.strip():
     searchable = (
         filtered["company_name"].fillna("").astype(str)
@@ -367,13 +438,13 @@ if search_text.strip():
         )
     ]
 
+# Filter by industry
 if selected_industry != "All industries":
     filtered = filtered[
         filtered["industry"] == selected_industry
     ]
 
-filtered = filtered[filtered["score"] >= min_score]
-
+# Filter by AI buyer status
 if selected_status == "Not yet qualified":
     filtered = filtered[
         filtered["buyer_status"].apply(is_missing)
@@ -390,12 +461,12 @@ elif selected_status != "All statuses":
         filtered["buyer_status"] == selected_status
     ]
 
+# Show highest-scoring leads first
 filtered = filtered.sort_values(
     "score",
     ascending=False,
 )
 
-# Prepare the display so missing values appear as readable text.
 display_columns = [
     column
     for column in [
@@ -461,114 +532,3 @@ st.dataframe(
 st.caption(
     f"Showing {len(filtered)} of {len(df)} saved leads."
 )
-
-
-# --------------------------------------------------
-# LEAD QUALIFICATION DETAILS
-# --------------------------------------------------
-
-st.divider()
-st.subheader("🔎 Lead Qualification Details")
-
-company_options = {
-    f"{display_value(row.get('company_name'), 'Unnamed company')} "
-    f"(ID: {row['id']})": row["id"]
-    for _, row in df.iterrows()
-}
-
-if company_options:
-    selected_company = st.selectbox(
-        "Select a lead to inspect",
-        list(company_options.keys()),
-    )
-
-    selected_id = company_options[selected_company]
-    selected_rows = df[df["id"] == selected_id]
-
-    if not selected_rows.empty:
-        lead = selected_rows.iloc[0]
-
-        detail_col1, detail_col2 = st.columns(2)
-
-        with detail_col1:
-            st.write(
-                "**Company:**",
-                display_value(lead.get("company_name")),
-            )
-
-            st.write(
-                "**Buyer status:**",
-                display_value(
-                    lead.get("buyer_status"),
-                    "Not yet qualified",
-                ),
-            )
-
-            st.write(
-                "**Buyer type:**",
-                display_value(lead.get("buyer_type")),
-            )
-
-            confidence = lead.get("ai_confidence")
-
-            st.write(
-                "**AI confidence:**",
-                f"{int(confidence)}%"
-                if pd.notna(confidence)
-                else "Not available",
-            )
-
-        with detail_col2:
-            target_country = lead.get("target_country")
-
-            if is_missing(target_country):
-                target_country = lead.get("country")
-
-            st.write(
-                "**Target country:**",
-                display_value(target_country),
-            )
-
-            st.write(
-                "**Recommended action:**",
-                display_value(lead.get("recommended_next_action")),
-            )
-
-            st.write(
-                "**Products of interest:**",
-                display_value(lead.get("products_of_interest")),
-            )
-
-        reason = lead.get("qualification_reason")
-
-        if not is_missing(reason):
-            st.write("**Qualification reason**")
-            st.write(reason)
-
-        evidence = lead.get("ai_evidence")
-
-        if not is_missing(evidence):
-            st.write("**Evidence supplied by the AI**")
-
-            try:
-                evidence_items = json.loads(evidence)
-
-                if isinstance(evidence_items, list):
-                    for item in evidence_items:
-                        st.markdown(f"- {item}")
-                else:
-                    st.write(evidence)
-
-            except (json.JSONDecodeError, TypeError):
-                st.write(evidence)
-
-        ai_error = lead.get("ai_qualification_error")
-
-        if not is_missing(ai_error):
-            st.warning(f"AI qualification error: {ai_error}")
-
-        website = lead.get("website")
-
-        if not is_missing(website):
-            st.write("**Website:**", display_value(website))
-

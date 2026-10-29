@@ -1,5 +1,4 @@
 
-
 import json
 import os
 import time
@@ -31,11 +30,16 @@ if SEARCH_ENGINE not in SEARCH_ENDPOINTS:
 
 SEARCH_URL = SEARCH_ENDPOINTS[SEARCH_ENGINE]
 
-# Wait between requests to reduce unnecessary search traffic.
-SEARCH_DELAY_SECONDS = 4
+# Faster searches with less waiting.
+SEARCH_DELAY_SECONDS = 0.5
+SEARCH_TIMEOUT = (3, 8)
+SEARCH_MAX_ATTEMPTS = 2
 
-# Cache successful results locally.
-SEARCH_CACHE_FILE = Path("data/search_cache.json")
+SEARCH_CACHE_FILE = (
+    Path(__file__).resolve().parent.parent
+    / "data"
+    / "search_cache.json"
+)
 
 
 # ---------------------------------------------------------
@@ -91,16 +95,14 @@ COUNTRY_LANGUAGE_TERMS = {
 # ---------------------------------------------------------
 
 def load_search_cache() -> dict:
-    """Load cached search results, if the cache exists."""
+    """Load cached search results."""
     try:
         if SEARCH_CACHE_FILE.exists():
             data = json.loads(
                 SEARCH_CACHE_FILE.read_text(encoding="utf-8")
             )
-
             if isinstance(data, dict):
                 return data
-
     except (OSError, json.JSONDecodeError) as exc:
         print(f"Could not read search cache: {exc}")
 
@@ -108,13 +110,12 @@ def load_search_cache() -> dict:
 
 
 def save_search_cache(cache: dict) -> None:
-    """Save cached results to a local JSON file."""
+    """Save successful search results locally."""
     try:
         SEARCH_CACHE_FILE.parent.mkdir(
             parents=True,
             exist_ok=True,
         )
-
         SEARCH_CACHE_FILE.write_text(
             json.dumps(
                 cache,
@@ -123,9 +124,7 @@ def save_search_cache(cache: dict) -> None:
             ),
             encoding="utf-8",
         )
-
     except OSError as exc:
-        # Cache failure should not stop lead discovery.
         print(f"Could not save search cache: {exc}")
 
 
@@ -134,7 +133,7 @@ def save_search_cache(cache: dict) -> None:
 # ---------------------------------------------------------
 
 def build_search_queries(profile: dict) -> list[str]:
-    """Build searches for active products and target markets."""
+    """Build search queries for active products and target markets."""
     products = profile.get("products", [])
     countries = profile.get("target_countries", [])
 
@@ -148,7 +147,6 @@ def build_search_queries(profile: dict) -> list[str]:
 
             name = str(product.get("name", "")).strip()
             varieties = product.get("varieties", [])
-
         else:
             name = str(product).strip()
             varieties = []
@@ -170,11 +168,9 @@ def build_search_queries(profile: dict) -> list[str]:
             COUNTRY_LANGUAGE_TERMS.get(country, [])
         )
 
-        # General buyer searches.
         for term in buyer_terms:
             queries.append(f"{term} {country}")
 
-        # Product-specific searches.
         for name, varieties in active_products:
             for term in buyer_terms:
                 queries.append(
@@ -183,13 +179,11 @@ def build_search_queries(profile: dict) -> list[str]:
 
             for variety in varieties:
                 variety = str(variety).strip()
-
                 if variety:
                     queries.append(
                         f'"{variety}" "{name}" importer {country}'
                     )
 
-    # Preserve order while removing duplicate queries.
     return list(dict.fromkeys(queries))
 
 
@@ -233,11 +227,8 @@ def normalize_domain(url: str) -> str:
 
 def search_web(query: str, limit: int = 10) -> list[dict]:
     """
-    Search using the configured local OpenSERP service.
-
-    Successful responses are cached. Temporary server and connection
-    failures receive limited retries. HTTP 429 and 503 are not retried
-    immediately, to avoid repeatedly hitting a failing service.
+    Search OpenSERP, cache successful results, and use short
+    timeouts with a limited number of retries.
     """
     if not isinstance(query, str) or not query.strip():
         raise ValueError("Search query must not be empty.")
@@ -255,20 +246,18 @@ def search_web(query: str, limit: int = 10) -> list[dict]:
     cache = load_search_cache()
     cache_key = f"{SEARCH_ENGINE}:{query}:{limit}"
 
-    # Reuse a previous successful search.
     if cache_key in cache:
         cached_results = cache[cache_key]
-
         if isinstance(cached_results, list):
-            print(f"Using cached results for: {query}")
+            print(f"Using cached results: {query}")
             return cached_results
 
     last_error = None
 
-    for attempt in range(3):
+    for attempt in range(SEARCH_MAX_ATTEMPTS):
         try:
-            # Avoid unnecessary rapid requests to the search provider.
-            time.sleep(SEARCH_DELAY_SECONDS)
+            if SEARCH_DELAY_SECONDS > 0:
+                time.sleep(SEARCH_DELAY_SECONDS)
 
             response = requests.get(
                 SEARCH_URL,
@@ -276,42 +265,29 @@ def search_web(query: str, limit: int = 10) -> list[dict]:
                     "text": query,
                     "limit": limit,
                 },
-                timeout=25,
+                timeout=SEARCH_TIMEOUT,
             )
 
-            if response.status_code == 429:
+            if response.status_code in (429, 503):
                 raise requests.HTTPError(
-                    "Search service rate limited the request (HTTP 429).",
-                    response=response,
-                )
-
-            if response.status_code == 503:
-                raise requests.HTTPError(
-                    "Search service is temporarily unavailable (HTTP 503).",
+                    f"Search service returned HTTP "
+                    f"{response.status_code}.",
                     response=response,
                 )
 
             response.raise_for_status()
-
-            try:
-                data = response.json()
-
-            except ValueError as exc:
-                raise requests.RequestException(
-                    "Search service returned invalid JSON."
-                ) from exc
+            data = response.json()
 
             if not isinstance(data, dict):
                 raise requests.RequestException(
-                    "Search service returned an unexpected response format."
+                    "Unexpected search response format."
                 )
 
             results = data.get("results", [])
 
             if not isinstance(results, list):
                 raise requests.RequestException(
-                    "Search service response does not contain a valid "
-                    "results list."
+                    "Search response has no valid results list."
                 )
 
             cleaned_results = []
@@ -334,8 +310,6 @@ def search_web(query: str, limit: int = 10) -> list[dict]:
                     ),
                 })
 
-            # Cache only successful responses.
-            # An empty list is a valid successful result.
             cache[cache_key] = cleaned_results
             save_search_cache(cache)
 
@@ -343,50 +317,35 @@ def search_web(query: str, limit: int = 10) -> list[dict]:
 
         except requests.HTTPError as exc:
             last_error = exc
-
             status = (
                 exc.response.status_code
                 if exc.response is not None
                 else None
             )
 
-            # Do not immediately retry rate limits or service outages.
+            # Do not retry rate limits, service outages,
+            # or ordinary client errors.
             if status in (429, 503):
                 break
 
-            # Do not retry ordinary client errors.
             if status is not None and status < 500:
                 break
-
-            if attempt < 2:
-                delay = 2 ** attempt
-
-                print(
-                    f"Search attempt {attempt + 1} failed. "
-                    f"Retrying in {delay}s."
-                )
-
-                time.sleep(delay)
 
         except (
             requests.Timeout,
             requests.ConnectionError,
+            requests.RequestException,
+            ValueError,
         ) as exc:
             last_error = exc
 
-            if attempt < 2:
-                delay = 2 ** attempt
-
-                print(
-                    f"Search attempt {attempt + 1} failed. "
-                    f"Retrying in {delay}s."
-                )
-
-                time.sleep(delay)
-
-        except requests.RequestException as exc:
-            last_error = exc
-            break
+        if attempt < SEARCH_MAX_ATTEMPTS - 1:
+            delay = 1
+            print(
+                f"Search attempt {attempt + 1} failed. "
+                f"Retrying in {delay}s: {last_error}"
+            )
+            time.sleep(delay)
 
     raise requests.RequestException(
         f"Search via {SEARCH_ENGINE} failed: {last_error}"
@@ -398,12 +357,7 @@ def search_web(query: str, limit: int = 10) -> list[dict]:
 # ---------------------------------------------------------
 
 def is_relevant_result(result: dict) -> bool:
-    """
-    Filter obviously unrelated results.
-
-    A relevant keyword match does not prove that a company imports
-    or buys EGAST products.
-    """
+    """Filter obviously unrelated search results."""
     text = " ".join([
         str(result.get("title") or ""),
         str(result.get("snippet") or ""),
@@ -455,65 +409,73 @@ def is_relevant_result(result: dict) -> bool:
 # ---------------------------------------------------------
 
 def discover_leads(
-    max_queries: int | None = None,
+    max_queries: int = 3,
     results_per_query: int = 10,
+    max_results: int = 10,
+    exclude_domains: set[str] | None = None,
 ) -> list[dict]:
     """
-    Discover unique candidate websites.
+    Discover up to max_results unique candidate websites.
 
-    This function does not write results to the database.
+    Only max_queries searches are run. Existing domains can be
+    excluded before discovery results are returned.
+
+    This function does not save leads to the database.
     """
-    if max_queries is not None and max_queries < 0:
+
+    if max_queries < 0:
         raise ValueError(
-            "max_queries must be non-negative or None."
+            "max_queries must be non-negative."
         )
 
-    if results_per_query < 1:
+    if results_per_query < 1 or max_results < 1:
         raise ValueError(
-            "results_per_query must be positive."
+            "Result limits must be positive."
         )
 
     profile = load_company_profile()
-    queries = build_search_queries(profile)
+    countries = profile.get("target_countries", [])
+    queries = build_search_queries(profile)[:max_queries]
 
-    if max_queries is not None:
-        queries = queries[:max_queries]
+    excluded = {
+        normalize_domain(domain)
+        for domain in (exclude_domains or set())
+        if domain
+    }
 
     discovered = []
     seen_domains = set()
-    countries = profile.get("target_countries", [])
 
-    print("Target countries: " + ", ".join(countries))
-    print(f"Search queries to run: {len(queries)}")
-    print(
-        f"Results requested per query: {results_per_query}"
-    )
+    print(f"Target countries: {', '.join(countries)}")
+    print(f"Queries in this batch: {len(queries)}")
+    print(f"Maximum candidate websites: {max_results}")
 
     for index, query in enumerate(queries, start=1):
-        print(f"\nSearch {index}/{len(queries)}: {query}")
+        if len(discovered) >= max_results:
+            break
+
+        print(f"Search {index}/{len(queries)}: {query}")
 
         try:
             results = search_web(
                 query,
                 limit=results_per_query,
             )
-
         except requests.RequestException as exc:
-            print(f"Search failed: {exc}")
-            continue
-
-        except (ValueError, TypeError) as exc:
-            print(f"Invalid search response: {exc}")
+            print(f"Search failed; continuing to next query: {exc}")
             continue
 
         for result in results:
             if not is_relevant_result(result):
                 continue
 
-            url = result.get("url", "").strip()
+            url = str(result.get("url") or "").strip()
             domain = normalize_domain(url)
 
-            if not domain or domain in seen_domains:
+            if not domain:
+                continue
+
+            if domain in excluded or domain in seen_domains:
                 continue
 
             seen_domains.add(domain)
@@ -521,7 +483,6 @@ def discover_leads(
             candidate = dict(result)
             candidate["domain"] = domain
             candidate["search_query"] = query
-
             candidate["target_country"] = next(
                 (
                     country
@@ -533,8 +494,11 @@ def discover_leads(
 
             discovered.append(candidate)
 
+            if len(discovered) >= max_results:
+                break
+
     print(
-        f"\nUnique relevant websites: {len(discovered)}"
+        f"Unique new candidate websites: {len(discovered)}"
     )
 
     return discovered
@@ -545,15 +509,16 @@ def discover_leads(
 # ---------------------------------------------------------
 
 def discover_linkedin_company_pages(
-    max_queries: int = 20,
+    max_queries: int = 3,
     results_per_query: int = 10,
 ) -> list[dict]:
     """
-    Discover public LinkedIn company-page URLs via search results.
+    Discover public LinkedIn company-page URLs through search.
 
-    This function does not crawl LinkedIn or write to the database.
-    Personal profile URLs such as /in/ are excluded.
+    Does not crawl LinkedIn or save records to the database.
+    Personal profile URLs are excluded.
     """
+
     if max_queries < 0:
         raise ValueError(
             "max_queries must be non-negative."
@@ -589,11 +554,9 @@ def discover_linkedin_company_pages(
             if isinstance(product, dict):
                 if product.get("available") is False:
                     continue
-
                 product_name = str(
                     product.get("name") or ""
                 ).strip()
-
             else:
                 product_name = str(product).strip()
 
@@ -608,30 +571,26 @@ def discover_linkedin_company_pages(
     pages = []
     seen_urls = set()
 
-    print(
-        f"LinkedIn discovery queries: {len(queries)}"
-    )
+    print(f"LinkedIn discovery queries: {len(queries)}")
 
     for index, query in enumerate(queries, start=1):
-        print(f"\nSearch {index}/{len(queries)}: {query}")
+        print(f"LinkedIn search {index}/{len(queries)}: {query}")
 
         try:
             results = search_web(
                 query,
                 limit=results_per_query,
             )
-
         except requests.RequestException as exc:
-            print(f"Search failed: {exc}")
+            print(f"LinkedIn search failed: {exc}")
             continue
 
         for result in results:
-            url = result.get("url", "").strip()
+            url = str(result.get("url") or "").strip()
 
             try:
                 parsed = urlsplit(url)
                 hostname = (parsed.hostname or "").lower()
-
             except ValueError:
                 continue
 
@@ -650,7 +609,6 @@ def discover_linkedin_company_pages(
                 if part
             ]
 
-            # Only accept company pages, not personal profiles.
             if (
                 len(path_parts) < 2
                 or path_parts[0].lower() != "company"
@@ -668,9 +626,9 @@ def discover_linkedin_company_pages(
 
             country = next(
                 (
-                    c
-                    for c in countries
-                    if c.lower() in query.lower()
+                    item
+                    for item in countries
+                    if item.lower() in query.lower()
                 ),
                 "",
             )
@@ -686,8 +644,7 @@ def discover_linkedin_company_pages(
             })
 
     print(
-        "\nUnique LinkedIn company-page candidates: "
-        f"{len(pages)}"
+        f"Unique LinkedIn company-page candidates: {len(pages)}"
     )
 
     return pages
