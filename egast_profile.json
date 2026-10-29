@@ -1,0 +1,64 @@
+
+{
+  "company_name": "EGAST",
+  "company_description": "Egyptian grower and exporter of fresh produce",
+  "business_model": [
+    "cultivation",
+    "packing",
+    "cold storage",
+    "export"
+  ],
+  "products": [
+    {
+      "name": "Fresh Oranges",
+      "varieties": ["Valencia", "Navel"],
+      "season": "November to May",
+      "available": true
+    },
+    {
+      "name": "Fresh Grapes",
+      "varieties": ["Red Seedless", "White Seedless"],
+      "season": "May to August",
+      "available": true
+    },
+    {
+      "name": "Fresh Pomegranates",
+      "varieties": ["Wonderful"],
+      "season": "September to February",
+      "available": true
+    }
+  ],
+  "target_countries": [
+    "Netherlands",
+    "Germany",
+    "United Kingdom",
+    "Saudi Arabia",
+    "United Arab Emirates"
+  ],
+  "certifications": [
+    "GLOBALG.A.P. - SAMPLE ONLY",
+    "BRCGS - SAMPLE ONLY"
+  ],
+  "packaging_options": [
+    "4 kg carton",
+    "8 kg carton",
+    "10 kg carton",
+    "Custom packaging subject to approval"
+  ],
+  "minimum_order_quantities": {
+    "fresh_oranges": "1 container - illustrative only",
+    "fresh_grapes": "1 container - illustrative only",
+    "fresh_pomegranates": "1 container - illustrative only"
+  },
+  "export_capabilities": {
+    "cold_storage": true,
+    "export_packaging": true,
+    "reefer_container_shipping": true,
+    "private_label": "subject to approval"
+  },
+  "sales_contact": "sales@example.com",
+  "approved_claims": [
+    "Egyptian fresh produce exporter",
+    "Integrated cultivation, packing, and cold storage model"
+  ]
+}

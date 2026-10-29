@@ -1,0 +1,39 @@
+credentials.json
+token.json
+
+# Python environment and cache
+.venv/
+__pycache__/
+*.py[cod]
+
+# Secrets and credentials
+.env
+.env.*
+!.env.example
+credentials.json
+token.json
+
+# Local databases and lead data
+*.db
+*.sqlite
+*.sqlite3
+data/
+
+# macOS and local development tools
+.DS_Store
+.agents/
+.claude/
+.pytest_cache/
+
+# Backup files
+*.backup
+*.backup*
+*.bak
+*.bak*
+*.before*
+*_backup.py
+*.security-backup
+*.backup*
+*.bak*
+*.pre_*
+*_before_*
