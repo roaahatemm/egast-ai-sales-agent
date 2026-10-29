@@ -1,11 +1,21 @@
-
-
 import json
-import time
+import os
 import requests
 
-OLLAMA_URL = "http://localhost:11434/api/chat"
-OLLAMA_MODEL = "qwen2.5:3b"
+# Local Ollama remains the default for development.
+# For Streamlit Cloud, set these values in App Settings -> Secrets:
+# OLLAMA_URL = "https://ollama.com/api/chat"
+# OLLAMA_MODEL = "<a model name supported by your Ollama Cloud account>"
+# OLLAMA_API_KEY = "<your Ollama API key>"
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/chat")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
+OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "").strip()
+
+OLLAMA_HEADERS = (
+    {"Authorization": f"Bearer {OLLAMA_API_KEY}"}
+    if OLLAMA_API_KEY
+    else {}
+)
 
 
 SCHEMA = {
@@ -19,39 +29,56 @@ SCHEMA = {
         "buyer_type": {
             "type": "string",
             "enum": [
-                "importer", "wholesaler", "distributor", "retailer",
-                "exporter", "producer", "marketplace", "market_report",
-                "other", "unknown",
+                "importer",
+                "wholesaler",
+                "distributor",
+                "retailer",
+                "exporter",
+                "producer",
+                "marketplace",
+                "market_report",
+                "other",
+                "unknown",
             ],
         },
         "products_of_interest": {
             "type": "array",
-            "maxItems": 5,
-            "items": {"type": "string", "maxLength": 40},
+            "items": {"type": "string"},
         },
-        "target_country": {"type": "string", "maxLength": 100},
+        "target_country": {"type": "string"},
         "evidence": {
             "type": "array",
-            "maxItems": 2,
-            "items": {"type": "string", "maxLength": 100},
+            "items": {"type": "string"},
         },
-        "qualification_reason": {"type": "string", "maxLength": 140},
-        "confidence": {"type": "integer", "minimum": 0, "maximum": 100},
+        "qualification_reason": {"type": "string"},
+        "confidence": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+        },
         "recommended_next_action": {
             "type": "string",
             "enum": [
-                "review_lead", "investigate_website",
-                "consider_for_outreach", "reject_lead",
+                "review_lead",
+                "investigate_website",
+                "consider_for_outreach",
+                "reject_lead",
             ],
         },
     },
     "required": [
-        "is_company", "buyer_status", "buyer_type", "products_of_interest",
-        "target_country", "evidence", "qualification_reason", "confidence",
+        "is_company",
+        "buyer_status",
+        "buyer_type",
+        "products_of_interest",
+        "target_country",
+        "evidence",
+        "qualification_reason",
+        "confidence",
         "recommended_next_action",
     ],
-    "additionalProperties": False,
 }
+
 
 def clean_text(value, limit=1500):
     """Convert a supplied value into safe, readable text."""
@@ -66,10 +93,10 @@ def clean_text(value, limit=1500):
 
 def qualify_lead(lead: dict) -> dict:
     """
-    Qualify a potential lead using local Ollama.
+    Qualify an existing lead using local Ollama.
 
-    Uses supplied evidence only. Qualification is not independent
-    verification of a company or proof of active purchasing demand.
+    The model must use supplied evidence rather than inventing
+    company details. Final decisions still require human review.
     """
 
     website_data = {
@@ -86,158 +113,122 @@ def qualify_lead(lead: dict) -> dict:
 You are a cautious B2B lead qualification assistant for EGAST,
 an Egyptian exporter of fresh oranges, grapes, and pomegranates.
 
-Assess whether the supplied lead could be a buyer of fresh produce.
+Your task is to assess whether the supplied lead could be a buyer
+of fresh produce.
 
 LEAD DATA:
 {json.dumps(website_data, ensure_ascii=False, indent=2)}
 
 STRICT EVIDENCE RULES:
 
-1. Use only the supplied data. You have not independently verified
-   this company or visited its website.
-2. A name, URL, industry label, or product mention alone does not
-   prove that a company purchases fresh produce.
-3. Never invent company activities, locations, products, import
-   history, customers, or business relationships.
-4. Treat supplied products as clues, not proof of purchasing activity.
-5. Importing, wholesaling, or distributing is relevant only when
-   supported by the supplied description.
-6. If evidence is insufficient, choose "uncertain".
-7. Do not confuse uncertainty about buyer suitability with whether
-   a business exists.
-8. Use the supplied country only when one is provided.
-9. Include only products supported by the supplied information.
-10. Evidence must describe information actually present in the input.
-11. Confidence must reflect the strength of the evidence. A URL alone
-    or a vague description should produce low confidence.
-12. If buyer_status is "uncertain", recommend "review_lead" or
-    "investigate_website".
-13. Do not recommend outreach based solely on a name or URL.
-14. A company exporting its own produce is not automatically a buyer
-    of produce from external suppliers.
-15. If the description explicitly says the company does not purchase
-    produce or does not buy from other suppliers, do not classify it
-    as a potential buyer based on that description alone.
+1. Use only the supplied lead data. You have not independently
+   visited or verified the website.
+2. A company name, website URL, country field, or industry label
+   is not proof that a company exists or imports produce.
+3. Do not invent company activities, locations, products,
+   import history, customers, or business relationships.
+4. Treat supplied products as associated lead data, not proof
+   that the company buys those products.
+5. Only describe importing as established evidence if the supplied
+   description explicitly states that the company imports products.
+6. If evidence is sparse, contradictory, fictional, or insufficient,
+   choose buyer_status = "uncertain".
+7. Set is_company to false only when the supplied data explicitly
+   establishes that the lead is fictional or is not a company.
+   Otherwise, use the available evidence cautiously.
+8. Do not confuse the company's country with EGAST's origin.
+   Use the supplied country for target_country only when present.
+   If no country is supplied, return an empty string.
+9. products_of_interest must contain only products explicitly
+   supported by the supplied description or product data.
+10. Evidence must describe information actually present in the
+    input. Do not present assumptions as verified facts.
+11. Confidence must reflect the strength of the supplied evidence.
+    A URL alone or a vague description should produce low confidence.
+12. If buyer_status is uncertain, recommended_next_action must
+    be "review_lead" or "investigate_website".
+13. Do not recommend outreach based solely on a company name,
+    URL, or generic industry label.
 
-CLASSIFICATION:
+CLASSIFICATION GUIDANCE:
 
-- potential_buyer: Evidence supports a relevant buyer category,
-  such as a fresh-produce importer, wholesaler, or distributor.
-- not_buyer: Evidence clearly indicates an unrelated business.
-- uncertain: Evidence is insufficient to establish buyer suitability.
+- potential_buyer:
+  The supplied evidence supports that the company is a relevant
+  buyer, importer, wholesaler, or distributor of fresh produce.
 
-OUTPUT QUALITY RULES:
+- not_buyer:
+  The supplied evidence clearly indicates that the lead is not
+  a relevant potential buyer.
 
-- Keep qualification_reason to one sentence, maximum 20 words.
-- Include at most 2 evidence items, each no longer than 12 words.
-- Return only the required fields.
-- Use short, direct phrases.
-- Never repeat facts or explain your reasoning step by step.
-- Use only supplied facts; do not invent information.
-- Use an empty array when no products are supported.
-- Use an empty string when the target country is unknown.
-- Return one complete JSON object matching the schema.
+- uncertain:
+  The supplied evidence is insufficient to make either conclusion.
+
+Return only JSON matching the required schema.
+Keep the qualification_reason concise.
 """
 
-    request_started = time.perf_counter()
-    response = requests.post(
-        OLLAMA_URL,
-        json={
-            "model": OLLAMA_MODEL,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a conservative business lead classifier. "
-                        "Never fabricate facts. Follow the schema exactly. "
-                        "When evidence is insufficient, classify as uncertain."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": prompt,
-                },
-            ],
-            "stream": False,
-            "format": SCHEMA,
-            "options": {
-                "temperature": 0,
-                "num_predict": 350,
+    request_payload = {
+        "model": OLLAMA_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are a conservative business lead classifier. "
+                    "Never fabricate facts. Follow the schema exactly. "
+                    "When evidence is insufficient, classify as uncertain."
+                ),
             },
+            {
+                "role": "user",
+                "content": prompt,
+            },
+        ],
+        "stream": False,
+        "format": SCHEMA,
+        "options": {
+            "temperature": 0,
+            "num_predict": 400,
         },
-        timeout=300,
-    )
+    }
 
-    
-    print(f"[AI TIMING] First Ollama request: {time.perf_counter() - request_started:.2f}s")
-    response.raise_for_status()
+    # Retry once if Ollama returns content that is not valid JSON.
+    qualification = None
+    last_json_error = None
 
-    response_data = response.json()
-    content = response_data["message"]["content"]
-    print(f"[AI TIMING] First response length: {len(content)} characters")
-    print(f"[AI TIMING] Stop reason: {response_data.get('done_reason')}")
-    print(f"[AI TIMING] Generated tokens: {response_data.get('eval_count')}")
+    for attempt in range(2):
+        if attempt == 1:
+            request_payload["messages"].append({
+                "role": "user",
+                "content": (
+                    "Your previous response was not valid JSON. "
+                    "Return only one valid JSON object matching the required schema. "
+                    "Do not include Markdown fences or explanatory text."
+                ),
+            })
 
-    try:
-        qualification = json.loads(content)
-
-    except json.JSONDecodeError as exc:
-        print(f"[AI TIMING] JSON parsing error: {exc}")
-        print(f"[AI TIMING] First response preview: {content[:500]!r}")
-        print("[AI TIMING] Invalid JSON; retrying qualification.")
-        retry_started = time.perf_counter()
-        # Ask Ollama to retry once with a shorter, valid JSON response.
-        retry_response = requests.post(
+        response = requests.post(
             OLLAMA_URL,
-            json={
-                "model": OLLAMA_MODEL,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": (
-                            "Return one complete, valid JSON object only. "
-                            "Follow the supplied schema exactly. "
-                            "Do not include markdown or commentary."
-                        ),
-                    },
-                    {
-                        "role": "user",
-                        "content": (
-                            "Retry the qualification from the original lead data below. "
-                            "Return one complete JSON object matching the schema. "
-                            "Keep qualification_reason to one short sentence and evidence "
-                            "to at most two short items. Do not include commentary.\n\n"
-                            f"Original qualification prompt:\n{prompt}"
-                        ),
-                    },
-                ],
-                "stream": False,
-                "format": SCHEMA,
-                "options": {
-                    "temperature": 0,
-                    "num_predict": 500,
-                },
-            },
+            headers=OLLAMA_HEADERS,
+            json=request_payload,
             timeout=300,
         )
-
-        print(f"[AI TIMING] Retry request: {time.perf_counter() - retry_started:.2f}s")
-        retry_response.raise_for_status()
-        retry_content = retry_response.json()["message"]["content"]
-        print(f"[AI TIMING] Retry response length: {len(retry_content)} characters")
+        response.raise_for_status()
+        content = response.json()["message"]["content"]
 
         try:
-            qualification = json.loads(retry_content)
+            qualification = json.loads(content)
+            break
         except json.JSONDecodeError as exc:
-            raise ValueError(
-                "Ollama returned invalid JSON twice; qualification was not saved."
-            ) from exc
+            last_json_error = exc
 
+    if qualification is None:
+        raise ValueError(
+            "Ollama returned invalid JSON after one retry."
+        ) from last_json_error
 
     # Verify required fields.
     missing_fields = [
-        field
-        for field in SCHEMA["required"]
+        field for field in SCHEMA["required"]
         if field not in qualification
     ]
 
@@ -246,7 +237,7 @@ OUTPUT QUALITY RULES:
             f"AI response is missing required fields: {missing_fields}"
         )
 
-    # Validate field types.
+    # Validate field types and allowed values.
     if not isinstance(qualification["is_company"], bool):
         raise ValueError("is_company must be a boolean.")
 
@@ -315,47 +306,37 @@ OUTPUT QUALITY RULES:
     if not 0 <= confidence <= 100:
         raise ValueError("confidence must be between 0 and 100.")
 
-    # Deterministic safeguards based on the supplied description.
+    # Conservative application-level safeguards.
     description = website_data["description"].lower()
 
-    negative_business_phrases = (
-        "does not import",
-        "do not import",
-        "doesn't import",
-        "not an importer",
-        "no imports",
-        "never imports",
-        "does not distribute",
-        "not a wholesaler",
-        "do not purchase produce",
-        "does not purchase produce",
-        "don't purchase produce",
-        "doesn't purchase produce",
-        "do not buy produce",
-        "does not buy produce",
-        "don't buy produce",
-        "doesn't buy produce",
+    # An exporter that explicitly says it does not purchase from suppliers
+    # must not be automatically classified as a buyer.
+    explicit_non_purchaser_phrases = (
+        "do not purchase",
+        "does not purchase",
+        "don't purchase",
+        "doesn't purchase",
         "do not buy from other suppliers",
         "does not buy from other suppliers",
-        "do not purchase from other suppliers",
-        "does not purchase from other suppliers",
-        "do not purchase produce from other suppliers",
-        "does not purchase produce from other suppliers",
-        "only export our own produce",
-        "only exports its own produce",
-        "only export our own fruit",
-        "only exports its own fruit",
+        "we do not buy",
+        "we don't buy",
+        "we do not purchase",
+        "we don't purchase",
+        "not purchase produce from other suppliers",
+    )
+    says_it_does_not_purchase = any(
+        phrase in description for phrase in explicit_non_purchaser_phrases
+    )
+    exporter_terms = ("exporter", "export our", "export its", "exports")
+    mentions_exporting = (
+        any(term in description for term in exporter_terms)
+        or "exporter" in website_data["industry"].lower()
     )
 
-    has_negative_business_statement = any(
-        phrase in description for phrase in negative_business_phrases
-    )
-
-    # Explicit negative purchasing evidence takes priority over the
-    # model's prediction and over positive keyword matches.
-    if has_negative_business_statement:
+    if says_it_does_not_purchase and mentions_exporting:
         qualification["buyer_status"] = "uncertain"
         qualification["buyer_type"] = "unknown"
+        qualification["products_of_interest"] = []
         qualification["confidence"] = min(
             qualification["confidence"], 40
         )
@@ -364,135 +345,29 @@ OUTPUT QUALITY RULES:
             if website_data["website"]
             else "review_lead"
         )
-        qualification["qualification_reason"] = (
-            "The supplied description contains an explicit statement "
-            "about not purchasing or importing produce. Buyer suitability "
-            "requires human review."
+
+    # Look for explicit importing language, while avoiding common
+    # phrases that deny or negate importing.
+    negative_import_phrases = (
+        "does not import",
+        "do not import",
+        "doesn't import",
+        "not an importer",
+        "no imports",
+        "never imports",
+    )
+    has_negative_import_statement = any(
+        phrase in description for phrase in negative_import_phrases
+    )
+    explicit_import_evidence = (
+        not has_negative_import_statement
+        and any(
+            term in description
+            for term in ("import", "importer", "imports", "importing")
         )
+    )
 
-    else:
-        activity_terms = (
-            "importer",
-            "importers",
-            "import",
-            "imports",
-            "importing",
-            "wholesaler",
-            "wholesalers",
-            "wholesale",
-            "distributor",
-            "distributors",
-            "distribution",
-        )
-
-        produce_terms = (
-            "fresh produce",
-            "fruit",
-            "fruits",
-            "vegetable",
-            "vegetables",
-            "citrus",
-            "orange",
-            "oranges",
-            "grape",
-            "grapes",
-            "pomegranate",
-            "pomegranates",
-        )
-
-        description_has_activity = any(
-            term in description for term in activity_terms
-        )
-        description_has_produce = any(
-            term in description for term in produce_terms
-        )
-
-        # A commercial description can support company identity,
-        # but a name or website alone cannot establish buyer intent.
-        if (
-            website_data["website"]
-            and description.strip()
-            and (
-                description_has_activity
-                or any(
-                    term in description
-                    for term in (
-                        "company",
-                        "supplier",
-                        "manufacturer",
-                        "retailer",
-                        "producer",
-                        "exporter",
-                        "export",
-                        "farm",
-                    )
-                )
-            )
-        ):
-            qualification["is_company"] = True
-
-        # Exporting own produce is not evidence that the company
-        # purchases produce from external suppliers.
-        export_only_terms = (
-            "export our own",
-            "exports its own",
-            "export their own",
-            "grow and export our own",
-            "grows and exports its own",
-        )
-
-        explicitly_export_only = any(
-            term in description for term in export_only_terms
-        )
-
-        explicit_buyer_activity = (
-            not explicitly_export_only
-            and description_has_activity
-            and description_has_produce
-        )
-
-        if qualification["is_company"] and explicit_buyer_activity:
-            qualification["buyer_status"] = "potential_buyer"
-
-            if any(
-                term in description
-                for term in ("importer", "importers", "import", "imports", "importing")
-            ):
-                qualification["buyer_type"] = "importer"
-            elif any(
-                term in description
-                for term in ("wholesaler", "wholesalers", "wholesale")
-            ):
-                qualification["buyer_type"] = "wholesaler"
-            else:
-                qualification["buyer_type"] = "distributor"
-
-            qualification["confidence"] = max(
-                qualification["confidence"], 50
-            )
-            qualification["recommended_next_action"] = (
-                "investigate_website"
-            )
-            qualification["qualification_reason"] = (
-                "The supplied description identifies a potentially "
-                "relevant fresh-produce business. Review the website "
-                "to confirm current products and purchasing fit."
-            )
-
-    # A clear unrelated business should not be sent for outreach.
-    if qualification["buyer_status"] == "not_buyer":
-        qualification["recommended_next_action"] = "reject_lead"
-        qualification["products_of_interest"] = []
-
-    # Never automatically approve outreach.
-    if qualification["recommended_next_action"] == "consider_for_outreach":
-        qualification["recommended_next_action"] = (
-            "investigate_website"
-            if website_data["website"]
-            else "review_lead"
-        )
-
-    # Uncertain leads remain unqualified and require review.
+    # Uncertain leads must not be treated as confirmed buyers.
     if qualification["buyer_status"] == "uncertain":
         qualification["confidence"] = min(
             qualification["confidence"], 40
@@ -504,7 +379,39 @@ OUTPUT QUALITY RULES:
             else "review_lead"
         )
 
+    # A lead marked as not a company cannot be a confirmed buyer.
+    if not qualification["is_company"]:
+        qualification["buyer_status"] = "uncertain"
+        qualification["buyer_type"] = "unknown"
+        qualification["products_of_interest"] = []
+        qualification["confidence"] = min(
+            qualification["confidence"], 40
+        )
+        qualification["recommended_next_action"] = (
+            "investigate_website"
+            if website_data["website"]
+            else "review_lead"
+        )
+
+    # A clear non-buyer should not be sent for outreach.
+    if qualification["buyer_status"] == "not_buyer":
+        qualification["recommended_next_action"] = "reject_lead"
+        qualification["products_of_interest"] = []
+
+    # The qualifier must never authorize outreach by itself.
+    # A sales employee should review the lead and decide whether to contact it.
+    # Keep the action conservative even when the AI suggests outreach.
+    if qualification["recommended_next_action"] == "consider_for_outreach":
+        qualification["recommended_next_action"] = (
+            "investigate_website"
+            if website_data["website"]
+            else "review_lead"
+        )
+
+    # Unqualified leads must not retain product interests or outreach.
     if qualification["buyer_status"] != "potential_buyer":
         qualification["products_of_interest"] = []
+        if qualification["recommended_next_action"] == "consider_for_outreach":
+            qualification["recommended_next_action"] = "review_lead"
 
     return qualification
