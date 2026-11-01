@@ -345,13 +345,41 @@ with control_col2:
 # LOAD CURRENT DATA
 # --------------------------------------------------
 
+
 df = load_leads()
 
+# Display the exported leads when the cloud database is empty.
 if df.empty:
-    st.info(
-        "No leads found yet. Click 'Discover New Leads' to start."
-    )
-    st.stop()
+    export_path = Path(__file__).resolve().parent / "egast_leads_export.csv"
+
+    if export_path.exists():
+        df = pd.read_csv(export_path)
+
+        # Ensure the dashboard has all expected columns.
+        expected_columns = [
+            "id", "company_name", "country", "industry", "website",
+            "email", "score", "buyer_status", "buyer_type",
+            "products_of_interest", "target_country", "ai_evidence",
+            "qualification_reason", "ai_confidence",
+            "recommended_next_action", "ai_qualification_error",
+        ]
+
+        for column in expected_columns:
+            if column not in df.columns:
+                df[column] = None
+
+        df["score"] = pd.to_numeric(
+            df["score"], errors="coerce"
+        ).fillna(0)
+
+        df["ai_confidence"] = pd.to_numeric(
+            df["ai_confidence"], errors="coerce"
+        )
+
+    else:
+        st.info("No leads found yet. Import your saved leads first.")
+        st.stop()
+
 
 # --------------------------------------------------
 # LEAD QUALIFICATION — MAIN KPIs ONLY
