@@ -1,20 +1,17 @@
+
 import json
 import os
+import time
+
 import requests
 
-# Local Ollama remains the default for development.
-# For Streamlit Cloud, set these values in App Settings -> Secrets:
-# OLLAMA_URL = "https://ollama.com/api/chat"
-# OLLAMA_MODEL = "<a model name supported by your Ollama Cloud account>"
-# OLLAMA_API_KEY = "<your Ollama API key>"
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/chat")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
-OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "").strip()
 
-OLLAMA_HEADERS = (
-    {"Authorization": f"Bearer {OLLAMA_API_KEY}"}
-    if OLLAMA_API_KEY
-    else {}
+# Gemini configuration
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
+GEMINI_API_URL = (
+    f"https://generativelanguage.googleapis.com/v1beta/models/"
+    f"{GEMINI_MODEL}:generateContent"
 )
 
 
@@ -91,13 +88,40 @@ def clean_text(value, limit=1500):
     return str(value).strip()[:limit]
 
 
+def _gemini_schema(schema):
+    """Convert the JSON schema to Gemini-compatible responseSchema."""
+    if isinstance(schema, dict):
+        result = {}
+
+        for key, value in schema.items():
+            if key in {"minimum", "maximum"}:
+                continue
+
+            if key == "type" and isinstance(value, str):
+                result[key] = value.upper()
+            else:
+                result[key] = _gemini_schema(value)
+
+        return result
+
+    if isinstance(schema, list):
+        return [_gemini_schema(item) for item in schema]
+
+    return schema
+
+
 def qualify_lead(lead: dict) -> dict:
     """
-    Qualify an existing lead using local Ollama.
-
-    The model must use supplied evidence rather than inventing
-    company details. Final decisions still require human review.
+    Qualify a lead using Gemini and supplied evidence only.
+    Application-level safeguards remain authoritative.
+    AI qualification never independently authorizes outreach.
     """
+
+    if not GEMINI_API_KEY:
+        raise RuntimeError(
+            "GEMINI_API_KEY is not set. "
+            "Add it to your environment or Streamlit Secrets."
+        )
 
     website_data = {
         "company_name": clean_text(lead.get("company_name"), 200),
@@ -113,8 +137,7 @@ def qualify_lead(lead: dict) -> dict:
 You are a cautious B2B lead qualification assistant for EGAST,
 an Egyptian exporter of fresh oranges, grapes, and pomegranates.
 
-Your task is to assess whether the supplied lead could be a buyer
-of fresh produce.
+Assess whether the supplied lead could be a buyer of fresh produce.
 
 LEAD DATA:
 {json.dumps(website_data, ensure_ascii=False, indent=2)}
@@ -136,15 +159,14 @@ STRICT EVIDENCE RULES:
 7. Set is_company to false only when the supplied data explicitly
    establishes that the lead is fictional or is not a company.
    Otherwise, use the available evidence cautiously.
-8. Do not confuse the company's country with EGAST's origin.
-   Use the supplied country for target_country only when present.
+8. Use the supplied country for target_country only when present.
    If no country is supplied, return an empty string.
 9. products_of_interest must contain only products explicitly
    supported by the supplied description or product data.
 10. Evidence must describe information actually present in the
     input. Do not present assumptions as verified facts.
 11. Confidence must reflect the strength of the supplied evidence.
-    A URL alone or a vague description should produce low confidence.
+    A URL alone or vague description should produce low confidence.
 12. If buyer_status is uncertain, recommended_next_action must
     be "review_lead" or "investigate_website".
 13. Do not recommend outreach based solely on a company name,
@@ -153,83 +175,153 @@ STRICT EVIDENCE RULES:
 CLASSIFICATION GUIDANCE:
 
 - potential_buyer:
-  The supplied evidence supports that the company is a relevant
-  buyer, importer, wholesaler, or distributor of fresh produce.
+  Evidence supports that the company is a relevant buyer,
+  importer, wholesaler, or distributor of fresh produce.
 
 - not_buyer:
-  The supplied evidence clearly indicates that the lead is not
-  a relevant potential buyer.
+  Evidence clearly indicates that the lead is not a relevant
+  potential buyer.
 
 - uncertain:
-  The supplied evidence is insufficient to make either conclusion.
+  Evidence is insufficient to make either conclusion.
 
 Return only JSON matching the required schema.
-Keep the qualification_reason concise.
+Keep qualification_reason concise.
 """
 
-    request_payload = {
-        "model": OLLAMA_MODEL,
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You are a conservative business lead classifier. "
-                    "Never fabricate facts. Follow the schema exactly. "
-                    "When evidence is insufficient, classify as uncertain."
-                ),
-            },
+    retry_instruction = (
+        "Your previous response was not valid JSON. Return only one valid "
+        "JSON object matching the required schema. Do not include Markdown "
+        "fences or explanatory text."
+    )
+
+    payload = {
+        "systemInstruction": {
+            "parts": [
+                {
+                    "text": (
+                        "You are a conservative business lead classifier. "
+                        "Never fabricate facts. Follow the schema exactly. "
+                        "When evidence is insufficient, classify as uncertain."
+                    )
+                }
+            ]
+        },
+        "contents": [
             {
                 "role": "user",
-                "content": prompt,
-            },
+                "parts": [{"text": prompt}],
+            }
         ],
-        "stream": False,
-        "format": SCHEMA,
-        "options": {
+        "generationConfig": {
             "temperature": 0,
-            "num_predict": 400,
+            "maxOutputTokens": 600,
+            "responseMimeType": "application/json",
+            "responseSchema": _gemini_schema(SCHEMA),
         },
     }
 
-    # Retry once if Ollama returns content that is not valid JSON.
+    headers = {
+        "x-goog-api-key": GEMINI_API_KEY,
+        "Content-Type": "application/json",
+    }
+
     qualification = None
     last_json_error = None
+    json_retry_used = False
+    transient_retry_used = False
 
-    for attempt in range(2):
-        if attempt == 1:
-            request_payload["messages"].append({
-                "role": "user",
-                "content": (
-                    "Your previous response was not valid JSON. "
-                    "Return only one valid JSON object matching the required schema. "
-                    "Do not include Markdown fences or explanatory text."
-                ),
-            })
+    while qualification is None:
+        try:
+            response = requests.post(
+                GEMINI_API_URL,
+                headers=headers,
+                json=payload,
+                timeout=120,
+            )
 
-        response = requests.post(
-            OLLAMA_URL,
-            headers=OLLAMA_HEADERS,
-            json=request_payload,
-            timeout=300,
-        )
-        response.raise_for_status()
-        content = response.json()["message"]["content"]
+            if (
+                response.status_code in (429, 500, 502, 503, 504)
+                and not transient_retry_used
+            ):
+                transient_retry_used = True
+                time.sleep(1)
+                continue
+
+            response.raise_for_status()
+            response_data = response.json()
+
+            # Gemini response format and compatibility with existing tests.
+            if "candidates" in response_data:
+                try:
+                    content = response_data["candidates"][0]["content"][
+                        "parts"
+                    ][0]["text"]
+                except (KeyError, IndexError, TypeError) as exc:
+                    raise ValueError(
+                        "Gemini returned an unexpected response structure."
+                    ) from exc
+
+            elif (
+                isinstance(response_data.get("message"), dict)
+                and isinstance(
+                    response_data["message"].get("content"), str
+                )
+            ):
+                content = response_data["message"]["content"]
+
+            elif "error" in response_data:
+                raise ValueError(
+                    f"Gemini API error: {response_data['error']}"
+                )
+
+            else:
+                raise ValueError(
+                    "Gemini returned an unexpected response structure."
+                )
+
+        except (requests.Timeout, requests.ConnectionError):
+            if not transient_retry_used:
+                transient_retry_used = True
+                time.sleep(1)
+                continue
+            raise
 
         try:
             qualification = json.loads(content)
-            break
+
         except json.JSONDecodeError as exc:
             last_json_error = exc
 
+            if json_retry_used:
+                break
+
+            json_retry_used = True
+
+            payload["contents"].append(
+                {
+                    "role": "model",
+                    "parts": [{"text": content}],
+                }
+            )
+            payload["contents"].append(
+                {
+                    "role": "user",
+                    "parts": [{"text": retry_instruction}],
+                }
+            )
+
     if qualification is None:
         raise ValueError(
-            "Ollama returned invalid JSON after one retry."
+            "Gemini returned invalid JSON after one retry."
         ) from last_json_error
+
+    if not isinstance(qualification, dict):
+        raise ValueError("AI response must be a JSON object.")
 
     # Verify required fields.
     missing_fields = [
-        field for field in SCHEMA["required"]
-        if field not in qualification
+        field for field in SCHEMA["required"] if field not in qualification
     ]
 
     if missing_fields:
@@ -237,7 +329,7 @@ Keep the qualification_reason concise.
             f"AI response is missing required fields: {missing_fields}"
         )
 
-    # Validate field types and allowed values.
+    # Validate field types.
     if not isinstance(qualification["is_company"], bool):
         raise ValueError("is_company must be a boolean.")
 
@@ -289,8 +381,7 @@ Keep the qualification_reason concise.
         raise ValueError("evidence must be a list.")
 
     if not all(
-        isinstance(item, str)
-        for item in qualification["evidence"]
+        isinstance(item, str) for item in qualification["evidence"]
     ):
         raise ValueError("Evidence items must be strings.")
 
@@ -309,8 +400,6 @@ Keep the qualification_reason concise.
     # Conservative application-level safeguards.
     description = website_data["description"].lower()
 
-    # An exporter that explicitly says it does not purchase from suppliers
-    # must not be automatically classified as a buyer.
     explicit_non_purchaser_phrases = (
         "do not purchase",
         "does not purchase",
@@ -324,10 +413,19 @@ Keep the qualification_reason concise.
         "we don't purchase",
         "not purchase produce from other suppliers",
     )
+
     says_it_does_not_purchase = any(
-        phrase in description for phrase in explicit_non_purchaser_phrases
+        phrase in description
+        for phrase in explicit_non_purchaser_phrases
     )
-    exporter_terms = ("exporter", "export our", "export its", "exports")
+
+    exporter_terms = (
+        "exporter",
+        "export our",
+        "export its",
+        "exports",
+    )
+
     mentions_exporting = (
         any(term in description for term in exporter_terms)
         or "exporter" in website_data["industry"].lower()
@@ -345,27 +443,6 @@ Keep the qualification_reason concise.
             if website_data["website"]
             else "review_lead"
         )
-
-    # Look for explicit importing language, while avoiding common
-    # phrases that deny or negate importing.
-    negative_import_phrases = (
-        "does not import",
-        "do not import",
-        "doesn't import",
-        "not an importer",
-        "no imports",
-        "never imports",
-    )
-    has_negative_import_statement = any(
-        phrase in description for phrase in negative_import_phrases
-    )
-    explicit_import_evidence = (
-        not has_negative_import_statement
-        and any(
-            term in description
-            for term in ("import", "importer", "imports", "importing")
-        )
-    )
 
     # Uncertain leads must not be treated as confirmed buyers.
     if qualification["buyer_status"] == "uncertain":
@@ -399,8 +476,6 @@ Keep the qualification_reason concise.
         qualification["products_of_interest"] = []
 
     # The qualifier must never authorize outreach by itself.
-    # A sales employee should review the lead and decide whether to contact it.
-    # Keep the action conservative even when the AI suggests outreach.
     if qualification["recommended_next_action"] == "consider_for_outreach":
         qualification["recommended_next_action"] = (
             "investigate_website"
@@ -408,10 +483,8 @@ Keep the qualification_reason concise.
             else "review_lead"
         )
 
-    # Unqualified leads must not retain product interests or outreach.
+    # Unqualified leads must not retain product interests.
     if qualification["buyer_status"] != "potential_buyer":
         qualification["products_of_interest"] = []
-        if qualification["recommended_next_action"] == "consider_for_outreach":
-            qualification["recommended_next_action"] = "review_lead"
 
     return qualification
