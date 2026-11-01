@@ -38,9 +38,10 @@ st.caption(
     "Discover, qualify, and prioritize potential fresh-produce buyers."
 )
 
-MAX_NEW_WEBSITES_PER_RUN = 10
-MAX_SEARCH_QUERIES = 3
-RESULTS_PER_QUERY = 10
+TARGET_NEW_LEADS_PER_RUN = 10
+MAX_SEARCH_QUERIES = 10
+RESULTS_PER_QUERY = 20
+MAX_CANDIDATES_PER_RUN = 100
 
 
 # --------------------------------------------------
@@ -154,148 +155,69 @@ def extract_url(result):
 # --------------------------------------------------
 
 def run_incremental_discovery():
-    """
-    Discover and process at most 10 new website candidates.
-
-    Reports candidate counts and actual database row counts so
-    we can distinguish discovery failures from save failures.
-    """
-
+    """Run discovery quietly and return a concise summary for the dashboard."""
     saved_before = get_all_leads()
     before_count = len(saved_before)
     known_domains = get_saved_domains(saved_before)
 
-    st.write(f"**Saved leads before discovery:** {before_count}")
-
-    db_path = getattr(
-        database_module,
-        "DATABASE_PATH",
-        "Database path not exposed by app.database",
-    )
-    st.write(f"**Database path:** `{db_path}`")
-
-    st.write(
-        f"Searching up to {MAX_SEARCH_QUERIES} queries for "
-        f"a maximum of {MAX_NEW_WEBSITES_PER_RUN} new websites..."
-    )
-
-    # This requires the updated app/discovery.py to accept these arguments.
     search_results = discover_leads(
         max_queries=MAX_SEARCH_QUERIES,
         results_per_query=RESULTS_PER_QUERY,
-        max_results=MAX_NEW_WEBSITES_PER_RUN,
+        max_results=MAX_CANDIDATES_PER_RUN,
         exclude_domains=known_domains,
     ) or []
 
-    st.write(
-        f"**Candidate results returned:** {len(search_results)}"
-    )
-
-    with st.expander("Inspect discovery results"):
-        st.json(search_results[:5])
-
-    new_urls = []
-    seen_domains = set()
+    candidate_urls = []
+    seen_domains = set(known_domains)
 
     for result in search_results:
         url = extract_url(result)
-
         if not url:
             continue
 
         domain = normalize_website(url)
-
-        if not domain:
-            continue
-
-        if domain in known_domains or domain in seen_domains:
+        if not domain or domain in seen_domains:
             continue
 
         seen_domains.add(domain)
-        new_urls.append(url)
+        candidate_urls.append(url)
 
-        if len(new_urls) >= MAX_NEW_WEBSITES_PER_RUN:
+        if len(candidate_urls) >= MAX_CANDIDATES_PER_RUN:
             break
-
-    st.write(
-        f"**New websites after duplicate filtering:** {len(new_urls)}"
-    )
-
-    if not new_urls:
-        saved_after = get_all_leads()
-        after_count = len(saved_after)
-
-        st.write(f"**Saved leads after discovery:** {after_count}")
-        st.write(
-            f"**Change in database row count:** "
-            f"{after_count - before_count}"
-        )
-
-        return {
-            "processed": 0,
-            "failed": 0,
-            "candidates": len(search_results),
-            "before": before_count,
-            "after": after_count,
-            "new_rows": after_count - before_count,
-        }
-
-    progress = st.progress(0)
-    status = st.empty()
 
     processed = 0
     failed = 0
 
-    for index, url in enumerate(new_urls, start=1):
-        status.write(
-            f"Processing website {index}/{len(new_urls)}: {url}"
-        )
-
+    for url in candidate_urls:
         try:
-            # Existing pipeline handles scraping, extraction,
-            # scoring, saving and AI qualification.
-            process_website(url)
-            processed += 1
-
-        except Exception as exc:
+            result = process_website(url)
+            if isinstance(result, dict) and result.get("error"):
+                failed += 1
+            else:
+                processed += 1
+        except Exception:
+            # Keep technical details out of the employee-facing dashboard.
             failed += 1
-            st.warning(
-                f"Failed to process {url}: "
-                f"{type(exc).__name__}: {exc}"
-            )
 
-        progress.progress(index / len(new_urls))
+        current_records = get_all_leads()
+        new_domains = get_saved_domains(current_records) - known_domains
 
-    # Re-read the database to verify whether records were saved.
+        if len(new_domains) >= TARGET_NEW_LEADS_PER_RUN:
+            break
+
     saved_after = get_all_leads()
     after_count = len(saved_after)
-    new_rows = after_count - before_count
-
-    status.write("Discovery batch finished.")
-
-    st.write(f"**Websites processed without an exception:** {processed}")
-    st.write(f"**Processing failures:** {failed}")
-    st.write(f"**Saved leads before:** {before_count}")
-    st.write(f"**Saved leads after:** {after_count}")
-    st.write(f"**Net change in database rows:** {new_rows}")
-
-    if new_rows <= 0 and processed > 0:
-        st.warning(
-            "Websites were processed, but the total database row count "
-            "did not increase. The pipeline may have updated existing "
-            "records, rejected extracted websites, or saved to a different "
-            "database. Check the terminal output and save_lead() logic."
-        )
+    new_domains = get_saved_domains(saved_after) - known_domains
 
     return {
         "processed": processed,
         "failed": failed,
-        "candidates": len(search_results),
         "before": before_count,
         "after": after_count,
-        "new_rows": new_rows,
+        "new_rows": after_count - before_count,
+        "new_leads": len(new_domains),
+        "target": TARGET_NEW_LEADS_PER_RUN,
     }
-
 
 # --------------------------------------------------
 # DASHBOARD CONTROLS
@@ -317,27 +239,18 @@ with control_col2:
         use_container_width=True,
     ):
         try:
-            with st.spinner("Discovering new websites..."):
+            with st.spinner("Please wait..."):
                 result = run_incremental_discovery()
 
-            st.success(
-                f"Batch finished. Processed: {result['processed']}; "
-                f"failures: {result['failed']}; "
-                f"database rows: {result['before']} → {result['after']}."
-            )
+            if result["new_leads"] > 0:
+                st.success(f"{result['new_leads']} new lead(s) added successfully.")
+            else:
+                st.info("No new leads were added this time.")
+        except Exception:
+            # Avoid exposing technical errors or pipeline details to employees.
+            st.error("We couldn't add new leads right now. Please try again later.")
 
-            if result["new_rows"] <= 0:
-                st.info(
-                    "No net increase in saved leads. Review the diagnostic "
-                    "numbers above to identify where the process stopped."
-                )
-
-        except Exception as exc:
-            st.error(
-                f"Discovery failed: {type(exc).__name__}: {exc}"
-            )
-
-        # Reload the UI from the database after processing.
+        # Reload the dashboard so the lead count reflects the latest database.
         st.rerun()
 
 
@@ -503,10 +416,8 @@ display_columns = [
         "industry",
         "website",
         "email",
-        "score",
         "buyer_status",
         "buyer_type",
-        "ai_confidence",
         "recommended_next_action",
     ]
     if column in filtered.columns
@@ -539,20 +450,8 @@ st.dataframe(
         "industry": "Industry",
         "website": st.column_config.LinkColumn("Website"),
         "email": "Email",
-        "score": st.column_config.NumberColumn(
-            "Lead Score",
-            min_value=0,
-            max_value=100,
-            format="%d/100",
-        ),
         "buyer_status": "AI Buyer Status",
         "buyer_type": "Buyer Type",
-        "ai_confidence": st.column_config.NumberColumn(
-            "AI Confidence",
-            min_value=0,
-            max_value=100,
-            format="%d%%",
-        ),
         "recommended_next_action": "Recommended Action",
     },
 )
