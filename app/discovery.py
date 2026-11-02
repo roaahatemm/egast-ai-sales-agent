@@ -1,4 +1,3 @@
-
 import json
 import os
 import time
@@ -43,51 +42,197 @@ SEARCH_CACHE_FILE = (
 
 
 # ---------------------------------------------------------
-# SEARCH TERMS
+# WORLDWIDE, MULTILINGUAL SEARCH TERMS
 # ---------------------------------------------------------
 
-BUYER_SEARCH_TERMS = [
+GLOBAL_BUYER_TERMS = [
     "fresh fruit importer",
-    "fruit and vegetable importer",
+    "fresh orange importer",
+    "citrus fruit importer",
+    "fruit import company",
+    "fruit wholesaler",
     "fresh produce wholesaler",
     "fruit distributor",
-    "fresh produce trading company",
-    "supermarket fresh produce procurement",
-    "supermarket fruit purchasing",
-    "fruit and vegetable retailer",
-    "fruit exporter",
-    "fresh produce sourcing company",
+    "fruit and vegetable importer",
+    "fresh produce distributor",
+    "fruit trading company",
+    "fruit purchasing company",
+    "fruit procurement",
+    "fruit buyer",
+    "fresh produce buyer",
+    "fruit supermarket supplier",
+    "fruit retail supplier",
+    "fresh fruit sourcing company",
+    "fruit market distributor",
 ]
 
-COUNTRY_LANGUAGE_TERMS = {
-    "Netherlands": [
-        "fruit importeur",
-        "groente fruit groothandel",
-        "fruits and vegetables importer",
+# Broad fruit coverage, in addition to the company's configured products.
+GLOBAL_FRUITS = [
+    "orange", "oranges", "citrus", "grape", "grapes",
+    "pomegranate", "pomegranates", "apple", "apples",
+    "banana", "bananas", "mango", "mangoes", "lemon", "lemons",
+    "lime", "limes", "mandarin", "mandarins", "tangerine",
+    "tangerines", "grapefruit", "peach", "peaches", "pear", "pears",
+    "plum", "plums", "strawberry", "strawberries", "blueberry",
+    "blueberries", "raspberry", "raspberries", "watermelon",
+    "melon", "kiwi", "pineapple", "avocado", "date", "dates",
+    "fig", "figs", "apricot", "apricots", "cherry", "cherries",
+    "papaya", "guava", "persimmon", "fresh fruit",
+]
+
+MULTILINGUAL_BUYER_TERMS = [
+    # Dutch
+    "fruitimporteur",
+    "groente en fruit groothandel",
+    "verse fruit importeur",
+    "citrus importeur",
+    # German
+    "Obstimporteur",
+    "Obst und Gemüse Großhandel",
+    "Frischobst Großhändler",
+    "Zitrusfrüchte Importeur",
+    # French
+    "importateur de fruits frais",
+    "grossiste en fruits",
+    "distributeur de fruits",
+    "importateur d'oranges",
+    # Spanish
+    "importador de frutas frescas",
+    "mayorista de frutas",
+    "distribuidor de frutas",
+    "importador de naranjas",
+    # Italian
+    "importatore di frutta fresca",
+    "grossista di frutta",
+    "distributore di frutta",
+    # Portuguese
+    "importador de frutas frescas",
+    "atacadista de frutas",
+    "distribuidor de frutas",
+    # Arabic
+    "مستورد فواكه",
+    "مستورد برتقال",
+    "تجارة الفواكه والخضروات",
+    "موزع فواكه طازجة",
+    # Turkish
+    "taze meyve ithalatçısı",
+    "meyve toptancısı",
+    "portakal ithalatçısı",
+    # Russian
+    "импортер свежих фруктов",
+    "оптовая торговля фруктами",
+    "импортер апельсинов",
+    # Chinese
+    "新鲜水果进口商",
+    "水果批发商",
+    "橙子进口商",
+]
+
+LOCALIZED_COUNTRY_TERMS = {
+    "netherlands": [
+        "fruitimporteur", "groente en fruit groothandel",
+        "verse fruit importeur", "citrus importeur",
     ],
-    "Germany": [
-        "Obst Importeur",
-        "Obst und Gemüse Großhandel",
-        "Frischobst Händler",
+    "germany": [
+        "Obstimporteur", "Obst und Gemüse Großhandel",
+        "Frischobst Großhändler", "Zitrusfrüchte Importeur",
     ],
-    "United Kingdom": [
-        "fresh fruit importer",
-        "fruit wholesaler",
-        "supermarket produce buyer",
+    "belgium": [
+        "fruitimporteur", "importateur de fruits frais",
+        "grossiste en fruits",
     ],
-    "Saudi Arabia": [
-        "fruit importer",
-        "fresh fruit wholesaler",
-        "مستورد فواكه",
-        "تجارة الفواكه",
-    ],
-    "United Arab Emirates": [
-        "fruit importer",
-        "fresh produce distributor",
-        "مستورد فواكه",
-        "تجارة الفواكه والخضروات",
+    "austria": ["Obstimporteur", "Obst und Gemüse Großhandel"],
+    "switzerland": [
+        "Obstimporteur", "importateur de fruits frais",
+        "grossiste en fruits",
     ],
 }
+
+
+def get_world_countries() -> list[str]:
+    """Return ISO country names using pycountry when installed."""
+    try:
+        import pycountry
+
+        return sorted({
+            country.name for country in pycountry.countries
+            if getattr(country, "name", None)
+        })
+    except ImportError:
+        # Keep global searches working without the optional dependency.
+        return []
+
+
+def build_search_queries(profile: dict) -> list[str]:
+    """Build global, product-specific, and worldwide buyer queries."""
+    products = profile.get("products", [])
+    profile_countries = profile.get("target_countries", [])
+
+    active_products = []
+    for product in products:
+        if isinstance(product, dict):
+            if product.get("available") is False:
+                continue
+            name = str(product.get("name", "")).strip()
+            varieties = product.get("varieties", [])
+        else:
+            name = str(product).strip()
+            varieties = []
+
+        if not name:
+            continue
+        if not isinstance(varieties, list):
+            varieties = []
+        active_products.append((name, varieties))
+
+    product_names = list(dict.fromkeys(
+        GLOBAL_FRUITS
+        + [name for name, _ in active_products]
+    ))
+
+    countries = list(dict.fromkeys(
+        [str(c).strip() for c in profile_countries
+         if str(c).strip()]
+        + get_world_countries()
+    ))
+
+    queries = []
+
+    # Broad searches without a country restriction.
+    queries.extend(GLOBAL_BUYER_TERMS)
+    queries.extend(MULTILINGUAL_BUYER_TERMS)
+
+    # Product-specific global searches, prioritizing the full fruit list.
+    for fruit in product_names:
+        for term in GLOBAL_BUYER_TERMS[:12]:
+            queries.append(f'"{fruit}" {term}')
+
+    # Worldwide country-specific searches.
+    for country in countries:
+        for term in GLOBAL_BUYER_TERMS:
+            queries.append(f'{term} "{country}"')
+
+        for fruit in product_names:
+            # Use fewer combinations per fruit to keep the query set useful.
+            for term in GLOBAL_BUYER_TERMS[:6]:
+                queries.append(f'"{fruit}" {term} "{country}"')
+
+        for term in LOCALIZED_COUNTRY_TERMS.get(country.lower(), []):
+            queries.append(f'{term} "{country}"')
+
+    # Variety-specific searches from the company profile.
+    for country in countries:
+        for name, varieties in active_products:
+            for variety in varieties:
+                variety = str(variety).strip()
+                if variety:
+                    queries.append(
+                        f'"{variety}" "{name}" importer "{country}"'
+                    )
+
+    return list(dict.fromkeys(
+        query.strip() for query in queries if query.strip()
+    ))
 
 
 # ---------------------------------------------------------
@@ -126,65 +271,6 @@ def save_search_cache(cache: dict) -> None:
         )
     except OSError as exc:
         print(f"Could not save search cache: {exc}")
-
-
-# ---------------------------------------------------------
-# QUERY GENERATION
-# ---------------------------------------------------------
-
-def build_search_queries(profile: dict) -> list[str]:
-    """Build search queries for active products and target markets."""
-    products = profile.get("products", [])
-    countries = profile.get("target_countries", [])
-
-    queries = []
-    active_products = []
-
-    for product in products:
-        if isinstance(product, dict):
-            if product.get("available") is False:
-                continue
-
-            name = str(product.get("name", "")).strip()
-            varieties = product.get("varieties", [])
-        else:
-            name = str(product).strip()
-            varieties = []
-
-        if not name:
-            continue
-
-        if not isinstance(varieties, list):
-            varieties = []
-
-        active_products.append((name, varieties))
-
-    if not active_products:
-        return []
-
-    for country in countries:
-        buyer_terms = list(BUYER_SEARCH_TERMS)
-        buyer_terms.extend(
-            COUNTRY_LANGUAGE_TERMS.get(country, [])
-        )
-
-        for term in buyer_terms:
-            queries.append(f"{term} {country}")
-
-        for name, varieties in active_products:
-            for term in buyer_terms:
-                queries.append(
-                    f'"{name}" {term} {country}'
-                )
-
-            for variety in varieties:
-                variety = str(variety).strip()
-                if variety:
-                    queries.append(
-                        f'"{variety}" "{name}" importer {country}'
-                    )
-
-    return list(dict.fromkeys(queries))
 
 
 # ---------------------------------------------------------
@@ -413,6 +499,7 @@ def discover_leads(
     results_per_query: int = 10,
     max_results: int = 10,
     exclude_domains: set[str] | None = None,
+    query_offset: int = 0,
 ) -> list[dict]:
     """
     Discover up to max_results unique candidate websites.
@@ -435,13 +522,28 @@ def discover_leads(
 
     profile = load_company_profile()
     countries = profile.get("target_countries", [])
-    queries = build_search_queries(profile)[:max_queries]
+    all_queries = build_search_queries(profile)
+    if not all_queries:
+        return []
 
-    excluded = {
-        normalize_domain(domain)
-        for domain in (exclude_domains or set())
-        if domain
-    }
+    # Rotate through the full query list instead of repeating the first
+    # few queries on every click.
+    start = query_offset % len(all_queries)
+    queries = [
+        all_queries[(start + i) % len(all_queries)]
+        for i in range(min(max_queries, len(all_queries)))
+    ]
+
+    excluded = set()
+    for value in (exclude_domains or set()):
+        raw = str(value or "").strip()
+        if not raw:
+            continue
+        # normalize_domain expects a URL with http(s); accept bare domains too.
+        candidate = raw if "://" in raw else f"https://{raw}"
+        domain = normalize_domain(candidate)
+        if domain:
+            excluded.add(domain)
 
     discovered = []
     seen_domains = set()
@@ -530,17 +632,14 @@ def discover_linkedin_company_pages(
         )
 
     profile = load_company_profile()
-    countries = profile.get("target_countries", [])
+    countries = list(dict.fromkeys(
+        [str(c).strip() for c in profile.get("target_countries", [])
+         if str(c).strip()]
+        + get_world_countries()
+    ))
     products = profile.get("products", [])
 
-    buyer_terms = [
-        "fresh fruit importer",
-        "fresh produce wholesaler",
-        "fruit distributor",
-        "fruit and vegetable importer",
-        "supermarket produce procurement",
-        "fresh produce trading company",
-    ]
+    buyer_terms = GLOBAL_BUYER_TERMS[:8] + MULTILINGUAL_BUYER_TERMS[:8]
 
     queries = []
 
@@ -565,6 +664,16 @@ def discover_linkedin_company_pages(
                     f'site:linkedin.com/company/ '
                     f'"{product_name}" importer "{country}"'
                 )
+
+    # Add global LinkedIn company searches so discovery is not limited
+    # to country names present in the profile.
+    for term in GLOBAL_BUYER_TERMS[:8]:
+        queries.append(f'site:linkedin.com/company/ "{term}"')
+
+    for fruit in GLOBAL_FRUITS:
+        queries.append(
+            f'site:linkedin.com/company/ "{fruit}" "importer"'
+        )
 
     queries = list(dict.fromkeys(queries))[:max_queries]
 
